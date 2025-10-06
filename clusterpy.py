@@ -21,7 +21,7 @@ formatter = logging.Formatter('%(asctime)s: [%(levelname)s] %(threadName)s %(nam
 handler = logging.StreamHandler()
 handler.setFormatter(formatter)
 log = logging.getLogger("clusterpy")
-log.setLevel(logging.INFO)
+log.setLevel(logging.DEBUG)
 log.addHandler(handler)
 
 unicode = True
@@ -155,6 +155,10 @@ class ConnectionState(Enum):
 
 class ClusterNode(object):
     def __init__(self, nodeid, address, listenport):
+        assert nodeid is not None
+        assert address is not None
+        assert listenport is not None
+
         self.address = address
         self.listenport = int(listenport)
         self.nodeid = nodeid
@@ -303,8 +307,10 @@ class ConnectionThread(threading.Thread):
 class ConnectionManager(object):
     """Manage the connections between nodes and routing of messages."""
     def __init__(self, selfnode: ClusterNode):
+        assert selfnode is not None
         self.selfnode = selfnode
-        self.nodes = [selfnode]
+        self.nodes = []
+        log.debug("set selfnode to %s", self.selfnode)
 
     def msgs_waiting(self) -> bool:
         for conn in self.selfnode.connections:
@@ -327,6 +333,7 @@ class ConnectionManager(object):
         self.selfnode.shutdown_threads()
 
     def add_node(self, node: ClusterNode):
+        assert node is not None
         self.nodes.append(node)
 
     def find_node_by_address(self, address: str):
@@ -343,9 +350,13 @@ class ConnectionManager(object):
     def setup_connections(self):
         self.nodes.sort(key=lambda x: str(x))
 
+        assert len(self.nodes) > 1
+
         nconnections = 0
         for node_a in self.nodes:
+            assert node_a is not None
             for node_b in self.nodes:
+                assert node_b is not None
                 if node_a is node_b:
                     continue
                 if node_a > node_b:
@@ -689,6 +700,7 @@ def main():
         sys.exit(1)
 
     manager = ConnectionManager(selfnode)
+    manager.add_node(selfnode)
 
     for node in args.nodes:
         try:
