@@ -16,13 +16,7 @@ import datetime
 import time
 from typing import TypeVar, Tuple, List
 
-formatter = logging.Formatter('%(asctime)s: [%(levelname)s] %(threadName)s %(name)s:%(lineno)s %(message)s', datefmt="%m-%d-%YT%I:%M:%S%z")
-#formatter = logging.Formatter('%(asctime)s: [%(levelname)s] %(threadName)s %(message)s', datefmt="%m-%d-%YT%I:%M:%S%z")
-handler = logging.StreamHandler()
-handler.setFormatter(formatter)
 log = logging.getLogger("clusterpy")
-log.setLevel(logging.DEBUG)
-log.addHandler(handler)
 
 unicode = True
 shutdown_asap = threading.Event()
@@ -43,6 +37,22 @@ if not unicode:
     BAD = "↓"
 
 ConnectionInfoT = TypeVar("ConnectionInfoT", bound="ConnectionInfo")
+
+def setup_native_logger(level):
+    """Call this if you want logs and you're not setting up your own."""
+    formatter = logging.Formatter('%(asctime)s: [%(levelname)s] %(threadName)s %(name)s:%(lineno)s %(message)s', datefmt="%m-%d-%YT%I:%M:%S%z")
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    log.setLevel(level)
+    log.addHandler(handler)
+
+def replace_logger(newlogger: logging.Logger):
+    """Replace this module's default logger with your own."""
+    global log
+    while len(log.handlers) > 0:
+        log.handlers.pop()
+
+    log = newlogger
 
 class ClusterMessage(object):
     """Formal cluster messages should be encapsulated in this class."""
@@ -147,11 +157,18 @@ class ConnectionError(RuntimeError):
     pass
 
 class ConnectionState(Enum):
+    """INTENT_CONNECT - we intend to initiate the connection
+       INTENT_LISTEN - we intend to listen for a connection
+       LISTENING - we are bound and listening
+       CONNECTEDA - we are connected, initiated from node_a
+       CONNECTEDB - we are connected, initiated from node_b
+       UNKNOWN - either don't know the state, or don't know the node"""
     INTENT_CONNECT = 1
     INTENT_LISTEN = 2
     LISTENING = 3
     CONNECTEDA = 4
     CONNECTEDB = 5
+    UNKNOWN = 6
 
 class ClusterNode(object):
     def __init__(self, nodeid, address, listenport):
@@ -162,9 +179,11 @@ class ClusterNode(object):
         self.address = address
         self.listenport = int(listenport)
         self.nodeid = nodeid
-        self.connections = []
+        self.connections: List[ConnectionInfoT] = []
         self.listen_threads = []
         self.connect_threads = []
+        self.success_callbacks = []
+        self.error_callbacks = []
 
     def __gt__(self, other):
         if str(self) > str(other):
@@ -174,6 +193,22 @@ class ClusterNode(object):
 
     def __str__(self):
         return "ClusterNode: %s" % (self.nodeid)
+
+    def add_success_callback(self, callback):
+        """Add a success callback to all connections."""
+        log.debug("ClusterNode.add_success_callback: nconnections %d",
+                  len(self.connections))
+        self.success_callbacks.append(callback)
+        for conn in self.connections:
+            conn.add_success_callback(callback)
+
+    def add_error_callback(self, callback):
+        """Add an error callback to all connections."""
+        log.debug("ClusterNode.add_error_callback: nconnections %d",
+                  len(self.connections))
+        self.error_callbacks.append(callback)
+        for conn in self.connections:
+            conn.add_error_callback(callback)
 
     def sig(self):
         return f"{self.nodeid}-{self.address}:{self.listenport}"
@@ -202,7 +237,15 @@ class ClusterNode(object):
             connect_thread.join()
 
     def add_connection(self, conn: ConnectionInfoT):
+        log.debug("adding connection %s to %s", conn, self)
         self.connections.append(conn)
+        for callback in self.success_callbacks:
+            conn.add_success_callback(callback)
+        log.debug("added success callbacks: %d", len(self.success_callbacks))
+        for callback in self.error_callbacks:
+            conn.add_error_callback(callback)
+        log.debug("added error callbacks: %d", len(self.error_callbacks))
+
         if conn.state == ConnectionState.INTENT_CONNECT:
             connthread = ConnectionThread(conn, name=conn.sig())
             self.connect_threads.append(connthread)
@@ -219,6 +262,9 @@ class ClusterNode(object):
             self.listen_threads.append(connthread)
             # This type of thread is added after we're up and running, so start it now.
             connthread.start()
+            # and call any success callbacks on it, since this is a new
+            # connection that has successfully come up
+            conn.success()
 
         else:
             raise AssertionError("wrong state for add_connection: %s", conn.state)
@@ -312,6 +358,16 @@ class ConnectionManager(object):
         self.nodes = []
         log.debug("set selfnode to %s", self.selfnode)
 
+    def remote_nodeid(self, conn: ConnectionInfoT):
+        """Given the ConnectionInfo conn, return the node id of the remote
+        end of the connection."""
+        if conn.node_a.nodeid == self.selfnode.nodeid:
+            return conn.node_b.nodeid
+        elif conn.node_b.nodeid == self.selfnode.nodeid:
+            return conn.node_a.nodeid
+        else:
+            return None
+
     def msgs_waiting(self) -> bool:
         for conn in self.selfnode.connections:
             if not conn.receiving_queue.empty():
@@ -335,6 +391,17 @@ class ConnectionManager(object):
     def add_node(self, node: ClusterNode):
         assert node is not None
         self.nodes.append(node)
+
+    def connection_state(self, nodeid: str) -> ConnectionState:
+        """Return the connection state of our connection to nodeid."""
+        if nodeid == self.selfnode.nodeid:
+            log.warning("connection_state: request to connect to selfnode")
+            return ConnectionState.CONNECTEDA
+        for connection in self.selfnode.connections:
+            if ( connection.node_a.nodeid == nodeid or
+                 connection.node_b.nodeid == nodeid ):
+                return connection.state
+        return ConnectionState.UNKNOWN
 
     def find_node_by_address(self, address: str):
         assert isinstance(address, str)
@@ -381,8 +448,8 @@ class ConnectionManager(object):
         channel.sending_queue.put(msg, block=True, timeout=TIMEOUT)
 
     def msg_for(self, nodeid: str, payload: str):
-        """Send a message to nodeid nodeid. Throws a RuntimeError exception if this is
-        not possible. If nodeid is None, we broadcast to all."""
+        """Send a message to nodeid nodeid. Throws a RuntimeError exception if
+        this is not possible. If nodeid is None, we broadcast to all."""
         broadcast = False if nodeid is not None else True
         connections = []
         for conn in self.selfnode.connections:
@@ -413,19 +480,55 @@ class ConnectionManager(object):
 class ConnectionInfo(object):
     def __init__(self, node_a: ClusterNode, node_b: ClusterNode, initial_state: ConnectionState, manager: ConnectionManager, sock=None):
         """Takes the address and port of the connection, and the initial_state
-        can be one of INTENT_CONNECT or INTENT_LISTEN. The last two
-        states indicate whether we initiated the connection, or waited for it."""
+        can be one of INTENT_CONNECT or INTENT_LISTEN. The last two states
+        indicate whether we initiated the connection, or waited for it."""
+        # node_a is always the initiating side of the connection
         self.node_a = node_a
+        # node_b is always the listening side of the connection
         self.node_b = node_b
         self.state = initial_state
         self.manager = manager
         self.listen_limit = 5
         self.sending_queue = queue.Queue(maxsize=MAX_QUEUESIZE)
         self.receiving_queue = queue.Queue(maxsize=MAX_QUEUESIZE)
+        # Functions to call when the connection successfully comes up
+        self.success_callbacks = []
+        # Functions to call when a successful connection drops, or an attempt
+        # to initiate a connection fails
+        self.error_callbacks = []
+        self.partial = None
         if sock is not None:
             self.sock = sock
         else:
             self.sock = self.create_socket()
+
+    def add_success_callback(self, callback):
+        """Add a callback for a successful connection. The only argument
+        passed to the handler is this ConnectionInfo object."""
+        log.debug("ConnectionInfo.add_success_callback")
+        self.success_callbacks.append(callback)
+
+    def add_error_callback(self, callback):
+        """Add a callback for an error. The only argument
+        passed to the handler is this ConnectionInfo object."""
+        log.debug("ConnectionInfo.add_error_callback")
+        self.error_callbacks.append(callback)
+
+    def success(self):
+        log.debug("calling all success callbacks: %d", len(self.success_callbacks))
+        for callback in self.success_callbacks:
+            try:
+                callback(self)
+            except Exception as err:
+                log.error("success callback threw an exception: %s", err)
+
+    def error(self):
+        log.debug("calling all error callbacks: %d", len(self.error_callbacks))
+        for callback in self.error_callbacks:
+            try:
+                callback(self)
+            except Exception as err:
+                log.error("error callback threw an exception: %s", err)
 
     def create_socket(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -448,6 +551,7 @@ class ConnectionInfo(object):
             try:
                 log.info("%s Not yet connected to %s", BAD, self.node_b.sig())
                 self.connect()
+                self.success()
             except (ConnectionRefusedError, TimeoutError, InterruptedError) as err:
                 log.error("%s", err)
                 self.state = ConnectionState.INTENT_CONNECT
@@ -486,6 +590,7 @@ class ConnectionInfo(object):
         finally:
             log.debug("creating new socket")
             self.sock = self.create_socket()
+            self.error()
 
     def valid_connection(self, addr):
         """Right now, return True if the IP is on our trusted list. But we need
@@ -511,6 +616,7 @@ class ConnectionInfo(object):
                 return
 
             log.info("connection from %s", node_b.sig())
+            self.success()
 
             if self.valid_connection(remote_addr):
                 log.info("we trust this endpoint")
@@ -549,7 +655,7 @@ class ConnectionInfo(object):
             self.state = ConnectionState.INTENT_LISTEN
 
         else:
-            raise AssertionError("Unaccounted for state: %s" % self.state)
+            log.warning("reset_state called on connection in state %s", self.state)
 
         log.debug("reset_state to %s", self.state)
 
@@ -594,6 +700,11 @@ class ConnectionInfo(object):
             else:
                 raise AssertionError("invalid message parsing: '%s'" % decodedbuf)
 
+        log.debug("returning msg count of %d", len(msgs))
+        if partial is not None:
+            log.debug("returning a partial")
+        else:
+            log.debug("not returning a partial")
         return (msgs, partial)
 
     def receive(self) -> ClusterMessage:
@@ -608,6 +719,9 @@ class ConnectionInfo(object):
             log.debug("received %d bytes from %s: %s",
                 len(data), self.node_b.sig(), data)
             if len(data) > 0:
+                if self.partial:
+                    data = self.partial + data
+                    self.partial = None
                 msgs, partial = self.split_msgs(data)
                 if partial is not None:
                     self.partial = partial
@@ -630,11 +744,13 @@ class ConnectionInfo(object):
                     except queue.Full as err:
                         log.error("full receiving queue: %s", err)
                         continue
+                    except Exception as err:
+                        log.exception("possibly bad message format: %s", err)
             else:
                 raise ConnectionResetError("0 bytes received")
 
         except (BrokenPipeError, ConnectionResetError) as err:
-            log.error("failed to send on socket: %s", err)
+            log.error("failed to receive on socket: %s", err)
             self.drop_socket()
             self.reset_state()
             return None
@@ -687,14 +803,23 @@ def shutdown_handler(signum, frame):
     shutdown_asap.set()
 
 def main():
+    setup_native_logger(logging.DEBUG)
     args = parse_args()
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
+
+    def success(info):
+        log.info("success from %s", info)
+
+    def error(info):
+        log.error("error from %s", info)
 
     selfnode: ClusterNode = None
     try:
         nodeid, address, port = args.self_node.split(":")
         selfnode: ClusterNode = ClusterNode(nodeid, address, port)
+        selfnode.add_success_callback(success)
+        selfnode.add_error_callback(error)
     except ValueError:
         sys.stderr.write("Bad input: %s must be (nodeid, address:port)\n")
         sys.exit(1)
@@ -706,6 +831,8 @@ def main():
         try:
             nodeid, address, port = node.split(":")
             cnode: ClusterNode = ClusterNode(nodeid, address, port)
+            cnode.add_success_callback(success)
+            cnode.add_error_callback(error)
             manager.add_node(cnode)
 
         except ValueError:
