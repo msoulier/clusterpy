@@ -21,14 +21,14 @@ log = logging.getLogger("clusterpy")
 unicode = True
 shutdown_asap = threading.Event()
 
-msgdelim = "\r\n"
-msgdelimb = b"\r\n"
+msgdelim = "\r\n\r\n"
+msgdelimb = b"\r\n\r\n"
 
 VERSION = 0.1
 MAX_QUEUESIZE = 100000
 SHORT_SLEEPTIME = 2
 LONG_SLEEPTIME = 10
-BUFSIZE = 4096
+BUFSIZE = 1024 * 1024
 TIMEOUT = 3
 GOOD = "\U0001f7e2"
 BAD = "\U0001f7e5"
@@ -301,6 +301,7 @@ class ConnectionReadingThread(threading.Thread):
         log.debug("ConnectionReadingThread starting")
         while not shutdown_asap.is_set():
             msg = self.conn.receive()
+            log.debug("reading thread: received a message")
             if msg is not None:
                 self.conn.receiving_queue.put(msg, block=True, timeout=TIMEOUT)
             else:
@@ -659,19 +660,14 @@ class ConnectionInfo(object):
 
         log.debug("reset_state to %s", self.state)
 
-    def send(self, msg: ClusterMessage, ping=False, pong=False):
-        """Send message on socket. If ping is True, msg can be None and we just
-        send a PING. Same goes with pong, respectively."""
+    def send(self, msg: ClusterMessage):
+        """Send message on socket."""
         try:
-            if ping:
-                data = b'PING' + msgdelimb
-            elif pong:
-                data = b'PONG' + msgdelimb
-            else:
-                msg.set_dtsent(datetime.datetime.now())
-                j = msg.tojson()
-                data = j.encode() + msgdelimb
+            msg.set_dtsent(datetime.datetime.now())
+            j = msg.tojson()
+            data = j.encode() + msgdelimb
             log.debug("sending msg '%s'", data.decode())
+            log.debug("msg is %d bytes in size", len(data))
 
             nbytes = self.sock.send(data)
             log.debug("sent %d bytes", nbytes)
@@ -699,10 +695,12 @@ class ConnectionInfo(object):
                 partial = pieces[-1].encode()
             else:
                 raise AssertionError("invalid message parsing: '%s'" % decodedbuf)
+        else:
+            partial = data
 
         log.debug("returning msg count of %d", len(msgs))
         if partial is not None:
-            log.debug("returning a partial")
+            log.debug("returning a partial of %d bytes", len(partial))
         else:
             log.debug("not returning a partial")
         return (msgs, partial)
@@ -726,13 +724,6 @@ class ConnectionInfo(object):
                 if partial is not None:
                     self.partial = partial
                 for msg in msgs:
-                    # Reserved word
-                    if msg == "PING":
-                        self.send(msg=None, pong=True)
-                        continue
-                    elif msg == "PONG":
-                        log.debug("got a PONG")
-                        continue
                     try:
                         cmsg = ClusterMessage(fromid=self.node_b.nodeid,
                                               toid=self.node_a.nodeid,
