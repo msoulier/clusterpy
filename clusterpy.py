@@ -40,7 +40,7 @@ ConnectionHandlerT = TypeVar("ConnectionHandlerT", bound="ConnectionHandler")
 
 def setup_native_logger(level):
     """Call this if you want logs and you're not setting up your own."""
-    formatter = logging.Formatter('%(asctime)s: [%(levelname)s] %(threadName)s %(name)s:%(lineno)s %(message)s', datefmt="%m-%d-%YT%I:%M:%S%z")
+    formatter = logging.Formatter('%(asctime)s: [%(levelname)s] <%(threadName)s> %(name)s:%(lineno)s %(message)s', datefmt="%m-%d-%YT%I:%M:%S%z")
     handler = logging.StreamHandler()
     handler.setFormatter(formatter)
     log.setLevel(level)
@@ -73,7 +73,7 @@ class ThreadTracker(object):
 
     def status_report(self):
         for sig in self.threads:
-            log.info("thread %s alive: %b", sig, self.threads[sig].is_alive())
+            log.info("thread %s alive: %s", sig, self.threads[sig].is_alive())
 
             if not self.threads[sig].is_alive():
                 self.untrack_thread(sig)
@@ -194,7 +194,8 @@ class ConnectionState(Enum):
     LISTENING = 3
     CONNECTEDA = 4
     CONNECTEDB = 5
-    UNKNOWN = 6
+    ERROR = 6
+    UNKNOWN = 7
 
 class ClusterNode(object):
     def __init__(self, nodeid, address, listenport):
@@ -210,6 +211,11 @@ class ClusterNode(object):
         self.connect_threads = []
         self.success_callbacks = []
         self.error_callbacks = []
+        self.rlock = threading.RLock()
+        log.debug("ClusterNode.ctor()")
+
+    def __del__(self):
+        log.debug("ClusterNode.dtor()")
 
     def __gt__(self, other):
         if str(self) > str(other):
@@ -220,17 +226,33 @@ class ClusterNode(object):
     def __str__(self):
         return "ClusterNode: %s" % (self.nodeid)
 
+    def remove_connection(self, conn: ConnectionHandlerT) -> bool:
+        """Look for and remove conn from our list of connections. Return
+        True if found, False otherwise."""
+        new_list = []
+        found = False
+        with self.rlock:
+            for connection in self.connections:
+                if connection is conn:
+                    found = True
+                    continue
+                new_list.append(connection)
+            self.connections = new_list
+        return found
+
     def add_success_callback(self, callback):
         """Add a success callback to all connections."""
-        self.success_callbacks.append(callback)
-        for conn in self.connections:
-            conn.add_success_callback(callback)
+        with self.rlock:
+            self.success_callbacks.append(callback)
+            for conn in self.connections:
+                conn.add_success_callback(callback)
 
     def add_error_callback(self, callback):
         """Add an error callback to all connections."""
-        self.error_callbacks.append(callback)
-        for conn in self.connections:
-            conn.add_error_callback(callback)
+        with self.rlock:
+            self.error_callbacks.append(callback)
+            for conn in self.connections:
+                conn.add_error_callback(callback)
 
     def sig(self):
         return f"{self.nodeid}-{self.address}:{self.listenport}"
@@ -260,11 +282,12 @@ class ClusterNode(object):
 
     def add_connection(self, conn: ConnectionHandlerT):
         log.debug("adding connection %s to %s", conn, self)
-        self.connections.append(conn)
-        for callback in self.success_callbacks:
-            conn.add_success_callback(callback)
-        for callback in self.error_callbacks:
-            conn.add_error_callback(callback)
+        with self.rlock:
+            self.connections.append(conn)
+            for callback in self.success_callbacks:
+                conn.add_success_callback(callback)
+            for callback in self.error_callbacks:
+                conn.add_error_callback(callback)
 
         if conn.state == ConnectionState.INTENT_CONNECT:
             connthread = ConnectionThread(conn, name=conn.sig())
@@ -301,12 +324,17 @@ class ConnectionWritingThread(threading.Thread):
         super().__init__(*args, **kwargs)
         log.debug("ConnectionWritingThread.ctor()")
         self.conn = conn
+        # Add to list of threads on the connection handler to allow for thread
+        # shutdown on a connection problem.
+        self.conn.threads.append(self)
+
+    def __del__(self):
+        log.debug("ConnectionWritingThread.dtor()")
 
     def run(self):
         log.debug("ConnectionWritingThread starting")
         while not shutdown_asap.is_set():
-            if ( self.conn.state != ConnectionState.CONNECTEDB and 
-                 self.conn.state != ConnectionState.CONNECTEDA ):
+            if not self.conn.is_connected():
                 time.sleep(SHORT_SLEEPTIME)
                 continue
             try:
@@ -315,27 +343,41 @@ class ConnectionWritingThread(threading.Thread):
                 self.conn.send(msg)
             except queue.Empty as err:
                 continue
-            except ConnectionError as err:
-                log.error("connection error: %s", err)
-                continue
+            except ConnectionResetError:
+                log.error("connection reset: putting %s into error state", self.conn)
+                self.conn.state = ERROR
+                # Exit the thread
+                return
 
 class ConnectionReadingThread(threading.Thread):
     def __init__(self, conn: ConnectionHandlerT, *args, **kwargs):
         super().__init__(*args, **kwargs)
         log.debug("ConnectionReadingThread.ctor()")
         self.conn = conn
+        # Add to list of threads on the connection handler to allow for thread
+        # shutdown on a connection problem.
+        self.conn.threads.append(self)
         self.partial = None
+
+    def __del__(self):
+        log.debug("ConnectionReadingThread.dtor()")
 
     def run(self):
         log.debug("ConnectionReadingThread starting")
         while not shutdown_asap.is_set():
-            msg = self.conn.receive()
-            if msg is not None:
-                log.debug("reading thread: received a message: %s", msg)
-                self.conn.receiving_queue.put(msg, block=True, timeout=TIMEOUT)
-            else:
-                log.debug("reading thread: receive returned None")
-                time.sleep(SHORT_SLEEPTIME)
+            try:
+                msg = self.conn.receive()
+                if msg is not None:
+                    log.debug("reading thread: received a message: %s", msg)
+                    self.conn.receiving_queue.put(msg, block=True, timeout=TIMEOUT)
+                else:
+                    log.debug("reading thread: receive returned None")
+                    time.sleep(SHORT_SLEEPTIME)
+            except ConnectionResetError:
+                log.error("connection reset: putting %s into error state", self.conn)
+                self.conn.state = ConnectionState.ERROR
+                # Exit the thread
+                return
 
 class ConnectionThread(threading.Thread):
     def __init__(self, conn: ConnectionHandlerT, *args, **kwargs):
@@ -347,44 +389,60 @@ class ConnectionThread(threading.Thread):
         self.read_thread = None
         self.write_thread = None
 
+    def __del__(self):
+        log.debug("ConnectionThread.dtor()")
+        self.shutdown()
+
     def shutdown(self):
-        log.debug("joining read thread")
-        self.read_thread.join()
-        log.debug("joining write thread")
-        self.write_thread.join()
+        if self.read_thread is not None:
+            log.debug("joining read thread")
+            self.read_thread.join()
+            self.read_thread = None
+        if self.write_thread is not None:
+            log.debug("joining write thread")
+            self.write_thread.join()
+            self.write_thread = None
 
     def run(self):
         log.debug("ConnectionThread starting")
         while not shutdown_asap.is_set():
-            # Go into listen state, or attempt to connect, or status report
-            self.conn.manage()
-            if self.conn.sock is None:
-                log.debug("waiting for socket")
-                time.sleep(SHORT_SLEEPTIME)
-                continue
+            try:
+                # Go into listen state, or attempt to connect, or status report
+                self.conn.manage()
+                if self.conn.sock is None:
+                    log.debug("waiting for socket")
+                    time.sleep(SHORT_SLEEPTIME)
+                    continue
 
-            # Only fully connected handlers need their own threads.
-            if ( self.conn.state == ConnectionState.CONNECTEDA or
-                 self.conn.state == ConnectionState.CONNECTEDB ):
-                if self.read_thread is None or not self.read_thread.is_alive():
-                    name = self.conn.sig() + "-reading"
-                    if self.read_thread is None:
-                        log.info("initializing read thread %s", name)
-                    else:
-                        log.error("read thread is dead - recreating")
-                    self.read_thread = ConnectionReadingThread(self.conn, name=name)
-                    self.read_thread.start()
+                # Only fully connected handlers need their own threads.
+                if self.conn.is_connected():
+                    if self.read_thread is None or not self.read_thread.is_alive():
+                        name = self.conn.sig() + "-reading"
+                        if self.read_thread is None:
+                            log.info("initializing read thread %s", name)
+                        else:
+                            log.error("read thread is dead - recreating")
+                        self.read_thread = ConnectionReadingThread(self.conn, name=name)
+                        self.read_thread.start()
 
-                if self.write_thread is None or not self.write_thread.is_alive():
-                    name = self.conn.sig() + "-writing"
-                    if self.write_thread is None:
-                        log.info("initializing write thread %s", name)
-                    else:
-                        log.error("write thread is dead - recreating")
-                    self.write_thread = ConnectionWritingThread(self.conn, name=name)
-                    self.write_thread.start()
+                    if self.write_thread is None or not self.write_thread.is_alive():
+                        name = self.conn.sig() + "-writing"
+                        if self.write_thread is None:
+                            log.info("initializing write thread %s", name)
+                        else:
+                            log.error("write thread is dead - recreating")
+                        self.write_thread = ConnectionWritingThread(self.conn, name=name)
+                        self.write_thread.start()
 
-            time.sleep(LONG_SLEEPTIME)
+                # Error checks
+                elif self.conn.state == ConnectionState.ERROR:
+                    # FIXME: yikes
+                    self.conn.node_a.remove_connection(self.conn)
+                    self.conn.node_b.remove_connection(self.conn)
+                time.sleep(LONG_SLEEPTIME)
+            
+            except Exception as err:
+                log.error("ConnectionThread fatal error caught: %s", err)
 
 class ConnectionManager(object):
     """Manage the connections between nodes and routing of messages."""
@@ -392,7 +450,10 @@ class ConnectionManager(object):
         assert selfnode is not None
         self.selfnode = selfnode
         self.nodes = []
-        log.debug("set selfnode to %s", self.selfnode)
+        log.debug("ConnectionManager.ctor(), set selfnode to %s", self.selfnode)
+
+    def __del__(self):
+        log.debug("ConnectionManager.dtor()")
 
     def remote_nodeid(self, conn: ConnectionHandlerT):
         """Given the ConnectionHandler conn, return the node id of the remote
@@ -539,6 +600,11 @@ class ConnectionHandler(object):
             self.sock = sock
         else:
             self.sock = self.create_socket()
+        self.threads = []
+        log.debug("ConnectionHandler.ctor()")
+
+    def __del__(self):
+        log.debug("ConnectionHandler.dtor()")
 
     def __str__(self):
         s = "ConnectionHandler: " + self.sig()
@@ -695,9 +761,6 @@ class ConnectionHandler(object):
         if self.state == ConnectionState.CONNECTEDA:
             self.state = ConnectionState.INTENT_CONNECT
 
-        elif self.state == ConnectionState.CONNECTEDB:
-            self.state = ConnectionState.INTENT_LISTEN
-
         else:
             log.warning("reset_state called on connection in state %s", self.state)
 
@@ -721,6 +784,7 @@ class ConnectionHandler(object):
             log.error("failed to send on socket: %s", err)
             self.drop_socket()
             self.reset_state()
+            raise ConnectionResetError(err)
 
     def split_msgs(self, data: bytes) -> Tuple[List[str], bytes]:
         """Take the incoming data and split it into messages, and any 
@@ -748,10 +812,16 @@ class ConnectionHandler(object):
             log.debug("not returning a partial")
         return (msgs, partial)
 
-    def receive(self) -> ClusterMessage:
-        """Block and receive message on socket."""
+    def is_connected(self):
         if ( self.state != ConnectionState.CONNECTEDB and 
              self.state != ConnectionState.CONNECTEDA ):
+            return False
+        else:
+            return True
+
+    def receive(self) -> ClusterMessage:
+        """Block and receive message on socket."""
+        if not self.is_connected():
             log.warning("receive: socket not ready to receive: %s", self.state)
             return None
 
@@ -792,13 +862,13 @@ class ConnectionHandler(object):
             log.error("receive: failed to receive on socket: %s", err)
             self.drop_socket()
             self.reset_state()
-            return None
+            raise ConnectionResetError(err)
 
         except Exception as err:
             log.error("receive: unknown error: %s", err)
             self.drop_socket()
             self.reset_state()
-            return None
+            raise ConnectionResetError(err)
 
 def parse_args():
     global unicode
@@ -842,7 +912,7 @@ def shutdown_handler(signum, frame):
     shutdown_asap.set()
 
 def main():
-    #setup_native_logger(logging.DEBUG)
+    setup_native_logger(logging.DEBUG)
     args = parse_args()
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
@@ -883,6 +953,7 @@ def main():
     while not shutdown_asap.is_set():
         log.info("thread count: %d", threading.active_count())
         log.info("selfnode is %s", selfnode.nodeid)
+        thread_tracker.status_report()
         if selfnode.nodeid == "vm1":
             try:
                 log.info("testing send from vm1 to vm2")
