@@ -9,7 +9,6 @@ import time
 import socket
 import logging
 import signal
-import select
 import queue
 import json
 import datetime
@@ -185,13 +184,13 @@ class ConnectionError(RuntimeError):
 class ConnectionState(Enum):
     """INTENT_CONNECT - we intend to initiate the connection
        INTENT_LISTEN - we intend to listen for a connection
-       LISTENING - we are bound and listening
+       ACCEPT - we are bound and blocked on accept
        CONNECTEDA - we are connected, initiated from node_a
        CONNECTEDB - we are connected, initiated from node_b
        UNKNOWN - either don't know the state, or don't know the node"""
     INTENT_CONNECT = 1
     INTENT_LISTEN = 2
-    LISTENING = 3
+    ACCEPT = 3
     CONNECTEDA = 4
     CONNECTEDB = 5
     ERROR = 6
@@ -341,11 +340,11 @@ class ConnectionWritingThread(threading.Thread):
                 msg = self.conn.sending_queue.get(block=True, timeout=TIMEOUT)
                 log.debug("found message on sending queue: %s", msg)
                 self.conn.send(msg)
-            except queue.Empty as err:
+            except queue.Empty:
                 continue
             except ConnectionResetError:
                 log.error("connection reset: putting %s into error state", self.conn)
-                self.conn.state = ERROR
+                self.conn.state = ConnectionState.ERROR
                 # Exit the thread
                 return
 
@@ -437,8 +436,13 @@ class ConnectionThread(threading.Thread):
                 # Error checks
                 elif self.conn.state == ConnectionState.ERROR:
                     # FIXME: yikes
+                    log.debug("found a connection in ERROR state")
                     self.conn.node_a.remove_connection(self.conn)
                     self.conn.node_b.remove_connection(self.conn)
+                    self.conn = None
+                    # Tell the tracker we're exiting.
+                    thread_tracker.untrack_thread(self.name)
+                    return
                 time.sleep(LONG_SLEEPTIME)
             
             except Exception as err:
@@ -613,8 +617,8 @@ class ConnectionHandler(object):
     def sig(self):
         """Simple identifier for logs."""
         if ( self.state == ConnectionState.INTENT_LISTEN or
-             self.state == ConnectionState.LISTENING ):
-            return f"{self.node_a.sig()}-LISTENING"
+             self.state == ConnectionState.ACCEPT ):
+            return f"{self.node_a.sig()}-ACCEPT"
         else:
             return f"{self.node_a.sig()}-{self.node_b.sig()}"
 
@@ -712,38 +716,44 @@ class ConnectionHandler(object):
 
     def listen(self):
         if self.state == ConnectionState.INTENT_LISTEN:
-            log.info("LISTENING for a connections")
-            self.state = ConnectionState.LISTENING
-            self.sock.listen(self.listen_limit)
-            # Note: we block here - so call it from the thread
-            log.debug("going into accept")
-            new_sock, remote_addr = self.sock.accept()
+            while True:
+                try:
+                    log.info("LISTENING for a connections")
+                    self.sock.listen(self.listen_limit)
+                    # Note: we block here - so call it from the thread
+                    self.state = ConnectionState.ACCEPT
+                    log.debug("going into accept")
+                    new_sock, remote_addr = self.sock.accept()
 
-            node_b = self.manager.find_node_by_address(remote_addr[0])
-            if node_b is None:
-                log.error("connection from unknown node: %s", remote_addr[0])
-                return
+                    node_b = self.manager.find_node_by_address(remote_addr[0])
+                    if node_b is None:
+                        log.error("connection from unknown node: %s", remote_addr[0])
+                        return
 
-            log.info("connection from %s", node_b.sig())
+                    log.info("connection from %s", node_b.sig())
 
-            if self.valid_connection(remote_addr):
-                log.info("we trust this incoming connection")
-                # We do not go to CONNECTEDB status, the new socket returned
-                # from accept is in that state.
-                conn = ConnectionHandler(self.node_a,
-                                         node_b,
-                                         ConnectionState.CONNECTEDB,
-                                         self.manager,
-                                         new_sock)
-                self.node_a.add_connection(conn)
-                # And call its success handler, as it's a new connection.
-                conn.success()
-            else:
-                log.warning("we do not trust this endpoint - dropping")
-                new_sock.shutdown(socket.SHUT_RDWR)
-                new_sock.close()
-        elif self.state == ConnectionState.LISTENING:
-            log.debug("listen called but we are already listening")
+                    if self.valid_connection(remote_addr):
+                        log.info("we trust this incoming connection")
+                        # We do not go to CONNECTEDB status, the new socket returned
+                        # from accept is in that state.
+                        conn = ConnectionHandler(self.node_a,
+                                                node_b,
+                                                ConnectionState.CONNECTEDB,
+                                                self.manager,
+                                                new_sock)
+                        self.node_a.add_connection(conn)
+                        # And call its success handler, as it's a new connection.
+                        conn.success()
+                    else:
+                        log.warning("we do not trust this endpoint - dropping")
+                        new_sock.shutdown(socket.SHUT_RDWR)
+                        new_sock.close()
+
+                except Exception as err:
+                    log.error("fatal error in accept loop: %s", err)
+                finally:
+                    # FIXME: should we go into ERROR state and let it be handled higher up?
+                    self.state = ConnectionState.INTENT_LISTEN
         else:
             log.debug("listen called but state is %s", self.state)
 
@@ -763,8 +773,6 @@ class ConnectionHandler(object):
 
         else:
             log.warning("reset_state called on connection in state %s", self.state)
-
-        log.debug("reset_state to %s", self.state)
 
     def send(self, msg: ClusterMessage):
         """Send message on socket."""
@@ -953,7 +961,7 @@ def main():
     while not shutdown_asap.is_set():
         log.info("thread count: %d", threading.active_count())
         log.info("selfnode is %s", selfnode.nodeid)
-        thread_tracker.status_report()
+        #thread_tracker.status_report()
         if selfnode.nodeid == "vm1":
             try:
                 log.info("testing send from vm1 to vm2")
