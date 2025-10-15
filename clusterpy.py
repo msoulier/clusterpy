@@ -347,37 +347,43 @@ class ClusterManager(object):
         assert len(self.nodes) > 1
 
         nconnections = 0
-        for node_a in self.nodes:
-            assert node_a is not None
-            for node_b in self.nodes:
-                assert node_b is not None
-                if node_a is node_b:
-                    continue
-                if node_a > node_b:
-                    log.debug("%s connects to %s", node_a, node_b)
-                    nconnections += 1
-                    # Note: We only need a ConnectionHandler object on the one
-                    # running on "us".
-                    if node_a is self.selfnode:
-                        log.info("node_a is us, we are connecting")
-                        conn_a = ConnectionHandler(
-                            node_a,
-                            node_b,
-                            ConnectionState.INTENT_CONNECT,
-                            self)
-                        node_a.add_connection(conn_a)
-                        conn_a.init_thread()
-                    elif node_b is self.selfnode:
-                        log.info("node_b is us, we are listening")
-                        conn_b = ConnectionHandler(
-                            node_b,
-                            node_a,
-                            ConnectionState.INTENT_LISTEN,
-                            self)
-                        node_b.add_connection(conn_b)
-                        conn_b.init_thread()
-                    else:
-                        log.warning("neither a or b is us - not involved")
+        with open("cluster.dot", "w") as dotfile:
+            dotfile.write("digraph Nodes {\n")
+            for i, node_a in enumerate(self.nodes):
+                assert node_a is not None
+                for node_b in self.nodes:
+                    assert node_b is not None
+                    if i == 0:
+                        dotfile.write("\"%s\" [shape=rectangle,label=\"%s %s %d\"]\n" % (node_b, node_b.nodeid, node_b.address, node_b.listenport))
+                    if node_a is node_b:
+                        continue
+                    if node_a > node_b:
+                        log.debug("%s connects to %s", node_a, node_b)
+                        dotfile.write("\"%s\" -> \"%s\"\n" % (node_a, node_b))
+                        nconnections += 1
+                        # Note: We only need a ConnectionHandler object on the one
+                        # running on "us".
+                        if node_a is self.selfnode:
+                            log.info("node_a is us, we are connecting")
+                            conn_a = ConnectionHandler(
+                                node_a,
+                                node_b,
+                                ConnectionState.INTENT_CONNECT,
+                                self)
+                            node_a.add_connection(conn_a)
+                            conn_a.init_thread()
+                        elif node_b is self.selfnode:
+                            log.info("node_b is us, we are listening")
+                            conn_b = ConnectionHandler(
+                                node_b,
+                                node_a,
+                                ConnectionState.INTENT_LISTEN,
+                                self)
+                            node_b.add_connection(conn_b)
+                            conn_b.init_thread()
+                        else:
+                            log.warning("neither a or b is us - not involved")
+            dotfile.write("}\n")
 
     def send_msg(self, channel: ConnectionHandlerT, msg: ClusterMessage):
         channel.sending_queue.put(msg, block=True, timeout=TIMEOUT)
@@ -408,6 +414,12 @@ class ClusterManager(object):
 
     def monitor_connections(self):
         """Run regularly to catch errors and reset the state on connection handlers to allow for re-attempts."""
+        log.info("======================================================")
+        log.info("======= status report ================================")
+        log.info("======================================================")
+        log.info("nthreads: %d", threading.active_count())
+        for thread in threading.enumerate():
+            log.info("    thread = %s", thread.name)
         for conn in self.selfnode.connections:
             log.debug("checking on selfnode connection %s", conn)
             if conn.is_connected():
@@ -454,8 +466,9 @@ class ConnectionHandler(object):
     def __del__(self):
         log.debug("ConnectionHandler.dtor()")
         for thread in self.threads:
-            log.debug("joining thread: %s", thread)
-            thread.join()
+            if thread.is_alive():
+                log.debug("joining thread: %s", thread)
+                thread.join()
 
     def __str__(self):
         s = "ConnectionHandler: " + self.sig()
@@ -958,6 +971,7 @@ def parse_args():
 def shutdown_handler(signum, frame):
     os.write(2, b"SHUTDOWN <===========\n")
     shutdown_asap.set()
+    signal.alarm(1)
 
 def main():
     setup_native_logger(logging.DEBUG)
