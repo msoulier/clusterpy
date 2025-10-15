@@ -306,7 +306,7 @@ class ClusterManager(object):
     def shutdown(self):
         log.info("ConnectionManager.shutdown")
         for conn in self.selfnode.connections:
-            log.info("conn %s")
+            log.info("conn %s", conn)
             for thread in conn.threads:
                 if thread.is_alive():
                     log.info("joining %s", thread)
@@ -377,7 +377,7 @@ class ClusterManager(object):
                         node_b.add_connection(conn_b)
                         conn_b.init_thread()
                     else:
-                        raise AssertionError("neither a or b is us")
+                        log.warning("neither a or b is us - not involved")
 
     def send_msg(self, channel: ConnectionHandlerT, msg: ClusterMessage):
         channel.sending_queue.put(msg, block=True, timeout=TIMEOUT)
@@ -804,6 +804,9 @@ class ConnectionWritingThread(threading.Thread):
                 # Exit the thread
                 return
 
+    def shutdown(self):
+        pass
+
 class ConnectionReadingThread(threading.Thread):
     def __init__(self, conn: ConnectionHandler, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -834,6 +837,9 @@ class ConnectionReadingThread(threading.Thread):
                 # Exit the thread
                 return
 
+    def shutdown(self):
+        pass
+
 class ConnectionThread(threading.Thread):
     def __init__(self, conn: ConnectionHandler, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -852,6 +858,7 @@ class ConnectionThread(threading.Thread):
         if self.read_thread is not None:
             if self.read_thread.is_alive():
                 log.info("joining read thread")
+                self.read_thread.shutdown()
                 self.read_thread.join()
                 self.read_thread = None
             else:
@@ -859,6 +866,7 @@ class ConnectionThread(threading.Thread):
         if self.write_thread is not None:
             if self.write_thread.is_alive():
                 log.info("joining write thread")
+                self.write_thread.shutdown()
                 self.write_thread.join()
                 self.write_thread = None
             else:
